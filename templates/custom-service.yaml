@@ -1,0 +1,23 @@
+# Custom sandbox service: __NAME__
+# Lives in ~/.sandbox/services/__NAME__.yaml and is merged into the sandbox stack.
+# Rules: keep the profile = service name, container_name = sbx-<name>,
+# join the `sandbox` network, bind ports to ${SBX_BIND:-127.0.0.1}.
+services:
+  __NAME__:
+    profiles: [__NAME__]
+    image: CHANGE_ME:latest
+    container_name: sbx-__NAME__
+    restart: unless-stopped
+    networks: [sandbox]
+    labels:
+      sbx.managed: "true"
+    # environment:
+    #   SOME_USER: ${SBX_USER:-sandbox}
+    #   SOME_PASSWORD: ${SBX_PASSWORD:-sandbox123}
+    ports:
+      - "${SBX_BIND:-127.0.0.1}:CHANGE_ME_HOST_PORT:CHANGE_ME_CONTAINER_PORT"
+    volumes:
+      - __NAME__-data:/data
+
+volumes:
+  __NAME__-data: { name: sbx-__NAME__-data }

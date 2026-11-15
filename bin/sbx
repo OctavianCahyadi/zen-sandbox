@@ -1,0 +1,713 @@
+#!/usr/bin/env bash
+# sbx — manage the shared local dev sandbox (zen-sandbox).
+# Compatible with bash 3.2 (macOS default).
+set -euo pipefail
+
+# ---------- paths ----------
+_resolve_dir() {
+  local p="$1" d
+  while [ -h "$p" ]; do
+    d="$(cd -P "$(dirname "$p")" && pwd)"
+    p="$(readlink "$p")"
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  cd -P "$(dirname "$p")" && pwd
+}
+SBX_SELF_DIR="$(_resolve_dir "${BASH_SOURCE[0]}")"
+SBX_ROOT="$(cd "$SBX_SELF_DIR/.." && pwd)"
+SBX_HOME="${SBX_HOME:-$HOME/.sandbox}"
+ENV_FILE="$SBX_HOME/.env"
+ENABLED_FILE="$SBX_HOME/enabled"
+RES_FILE="$SBX_HOME/resources.tsv"
+CUSTOM_DIR="$SBX_HOME/services"
+BUILTIN="postgres mysql redis rabbitmq mongo rustfs mailpit"
+
+# ---------- helpers ----------
+die()  { echo "sbx: $*" >&2; exit 1; }
+info() { echo "sbx: $*" >&2; }
+
+init_home() {
+  mkdir -p "$SBX_HOME" "$CUSTOM_DIR"
+  [ -f "$ENABLED_FILE" ] || : > "$ENABLED_FILE"
+  [ -f "$RES_FILE" ] || : > "$RES_FILE"
+  if [ ! -f "$ENV_FILE" ]; then
+    cat > "$ENV_FILE" <<'EOF'
+# zen-sandbox settings. Edit, then run `sbx up` to apply.
+SBX_USER=sandbox
+SBX_PASSWORD=sandbox123
+SBX_BIND=127.0.0.1
+# Host ports (change if they clash with something else on your machine)
+POSTGRES_PORT=5432
+MYSQL_PORT=3306
+REDIS_PORT=6379
+RABBITMQ_PORT=5672
+RABBITMQ_UI_PORT=15672
+MONGO_PORT=27017
+RUSTFS_PORT=9000
+RUSTFS_UI_PORT=9001
+MAILPIT_SMTP_PORT=1025
+MAILPIT_UI_PORT=8025
+# Versions
+POSTGRES_VERSION=17
+MYSQL_VERSION=8.4
+REDIS_VERSION=7
+RABBITMQ_VERSION=4
+MONGO_VERSION=8
+EOF
+  fi
+}
+
+load_env() {
+  set -a; . "$ENV_FILE"; set +a
+  : "${SBX_USER:=sandbox}" "${SBX_PASSWORD:=sandbox123}" "${SBX_BIND:=127.0.0.1}"
+  : "${POSTGRES_PORT:=5432}" "${MYSQL_PORT:=3306}" "${REDIS_PORT:=6379}"
+  : "${RABBITMQ_PORT:=5672}" "${RABBITMQ_UI_PORT:=15672}" "${MONGO_PORT:=27017}"
+  : "${RUSTFS_PORT:=9000}" "${RUSTFS_UI_PORT:=9001}"
+  : "${MAILPIT_SMTP_PORT:=1025}" "${MAILPIT_UI_PORT:=8025}"
+  HOST="localhost"; [ "$SBX_BIND" = "0.0.0.0" ] || [ "$SBX_BIND" = "127.0.0.1" ] || HOST="$SBX_BIND"
+}
+
+custom_services() {
+  local f
+  for f in "$CUSTOM_DIR"/*.yaml; do
+    [ -e "$f" ] || continue
+    basename "$f" .yaml
+  done
+}
+all_services() { echo $BUILTIN; custom_services | tr '\n' ' '; echo; }
+is_builtin()   { case " $BUILTIN " in *" $1 "*) return 0 ;; esac; return 1; }
+is_known() {
+  local s
+  for s in $(all_services); do [ "$s" = "$1" ] && return 0; done
+  return 1
+}
+is_enabled() { grep -qx "$1" "$ENABLED_FILE" 2>/dev/null; }
+enable_svc() { is_enabled "$1" || echo "$1" >> "$ENABLED_FILE"; }
+disable_svc() {
+  local tmp; tmp="$(mktemp)"
+  grep -vx "$1" "$ENABLED_FILE" > "$tmp" || true
+  mv "$tmp" "$ENABLED_FILE"
+}
+enabled_list() { grep -v '^[[:space:]]*$' "$ENABLED_FILE" 2>/dev/null || true; }
+
+docker_ok() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }
+need_docker() { docker_ok || die "Docker daemon is not reachable. Start Docker Desktop / OrbStack / colima first."; }
+
+running_list() {
+  docker ps --filter "label=com.docker.compose.project=sandbox" \
+    --format '{{.Label "com.docker.compose.service"}}' 2>/dev/null | sort -u || true
+}
+is_running() { running_list | grep -qx "$1"; }
+
+compose() {
+  local args f s
+  args=(-p sandbox --env-file "$ENV_FILE" -f "$SBX_ROOT/compose.yaml")
+  for f in "$CUSTOM_DIR"/*.yaml; do [ -e "$f" ] && args+=(-f "$f"); done
+  for s in $(enabled_list); do args+=(--profile "$s"); done
+  docker compose "${args[@]}" "$@"
+}
+
+validate_name() {
+  echo "$1" | grep -Eq '^[a-z][a-z0-9_]{0,62}$' \
+    || die "invalid name '$1' (use lowercase letters, digits, underscore; start with a letter)"
+}
+norm_name() { echo "$1" | tr '[:upper:]-. ' '[:lower:]___'; }
+
+res_add() {
+  grep -q "^$1	$2	" "$RES_FILE" 2>/dev/null && return 0
+  printf '%s\t%s\t%s\n' "$1" "$2" "$(date +%Y-%m-%d)" >> "$RES_FILE"
+}
+res_del() {
+  local tmp; tmp="$(mktemp)"
+  grep -v "^$1	$2	" "$RES_FILE" > "$tmp" || true
+  mv "$tmp" "$RES_FILE"
+}
+
+require_running() {
+  is_running "$1" || die "$1 is not running. Run: sbx up $1"
+}
+
+svc_desc() {
+  case "$1" in
+    postgres) echo "PostgreSQL" ;;  mysql) echo "MySQL" ;;
+    redis) echo "Redis" ;;          rabbitmq) echo "RabbitMQ + management UI" ;;
+    mongo) echo "MongoDB" ;;        rustfs) echo "RustFS (S3 compatible)" ;;
+    mailpit) echo "Mailpit (SMTP catcher + UI)" ;;
+    *) echo "custom ($CUSTOM_DIR/$1.yaml)" ;;
+  esac
+}
+
+svc_endpoint() {
+  case "$1" in
+    postgres) echo "$HOST:$POSTGRES_PORT" ;;
+    mysql)    echo "$HOST:$MYSQL_PORT" ;;
+    redis)    echo "$HOST:$REDIS_PORT" ;;
+    rabbitmq) echo "$HOST:$RABBITMQ_PORT, UI http://$HOST:$RABBITMQ_UI_PORT" ;;
+    mongo)    echo "$HOST:$MONGO_PORT" ;;
+    rustfs)   echo "http://$HOST:$RUSTFS_PORT, UI http://$HOST:$RUSTFS_UI_PORT/rustfs/console/" ;;
+    mailpit)  echo "smtp $HOST:$MAILPIT_SMTP_PORT, UI http://$HOST:$MAILPIT_UI_PORT" ;;
+    *) docker port "sbx-$1" 2>/dev/null | sed 's/.*-> //' | tr '\n' ' ' || true ;;
+  esac
+}
+
+# ---------- commands ----------
+cmd_up() {
+  need_docker
+  local s
+  if [ $# -gt 0 ]; then
+    for s in "$@"; do is_known "$s" || die "unknown service '$s'. See: sbx list"; done
+    for s in "$@"; do enable_svc "$s"; done
+    compose up -d --wait "$@" || { report_busy_ports "$@"; die "start failed. If a port is already in use: sbx port <service> auto"; }
+  else
+    [ -n "$(enabled_list)" ] || die "nothing enabled yet. Example: sbx up postgres redis"
+    compose up -d --wait || { report_busy_ports $(enabled_list); die "start failed. If a port is already in use: sbx port <service> auto"; }
+  fi
+  cmd_status
+}
+
+cmd_stop() {
+  need_docker
+  compose stop "$@"
+}
+
+cmd_restart() {
+  need_docker
+  compose restart "$@"
+}
+
+cmd_remove() {
+  need_docker
+  local purge=0 s svcs=""
+  for s in "$@"; do
+    case "$s" in --purge) purge=1 ;; *) svcs="$svcs $s" ;; esac
+  done
+  [ -n "$svcs" ] || die "usage: sbx remove <service...> [--purge]"
+  for s in $svcs; do
+    is_known "$s" || die "unknown service '$s'"
+    compose rm -sf "$s" >/dev/null 2>&1 || docker rm -f "sbx-$s" >/dev/null 2>&1 || true
+    disable_svc "$s"
+    if [ $purge -eq 1 ]; then
+      docker volume rm "sbx-$s-data" >/dev/null 2>&1 && info "deleted volume sbx-$s-data" || true
+      local tmp; tmp="$(mktemp)"
+      awk -F'\t' -v s="$s" '$1 !~ "^"s":"' "$RES_FILE" > "$tmp" || true
+      mv "$tmp" "$RES_FILE"
+    fi
+    info "removed $s$([ $purge -eq 1 ] && echo ' (data purged)' || echo ' (data kept)')"
+  done
+}
+
+cmd_status() {
+  if ! docker_ok; then echo "Docker daemon not reachable."; return 0; fi
+  docker ps -a --filter "label=com.docker.compose.project=sandbox" \
+    --format 'table {{.Label "com.docker.compose.service"}}\t{{.Status}}\t{{.Ports}}'
+}
+
+cmd_list() {
+  local s mark run
+  printf '%-10s %-9s %-8s %s\n' SERVICE ENABLED RUNNING DESCRIPTION
+  for s in $(all_services); do
+    mark="-"; is_enabled "$s" && mark="yes"
+    run="-"; docker_ok && is_running "$s" && run="yes"
+    printf '%-10s %-9s %-8s %s\n' "$s" "$mark" "$run" "$(svc_desc "$s")"
+  done
+}
+
+cmd_info() {
+  local list s
+  list="${*:-$(enabled_list)}"
+  [ -n "$list" ] || { echo "No services enabled."; return 0; }
+  echo "Default credentials: $SBX_USER / $SBX_PASSWORD   (docker network: sandbox)"
+  for s in $list; do
+    echo
+    echo "[$s] $(svc_desc "$s")"
+    echo "  host:      $(svc_endpoint "$s")"
+    case "$s" in
+      postgres)
+        echo "  in docker: postgres:5432"
+        echo "  url:       postgresql://$SBX_USER:$SBX_PASSWORD@$HOST:$POSTGRES_PORT/postgres"
+        echo "  jdbc:      jdbc:postgresql://$HOST:$POSTGRES_PORT/<db>" ;;
+      mysql)
+        echo "  in docker: mysql:3306  (root password = $SBX_PASSWORD)"
+        echo "  jdbc:      jdbc:mysql://$HOST:$MYSQL_PORT/<db>" ;;
+      redis)
+        echo "  in docker: redis:6379"
+        echo "  url:       redis://$HOST:$REDIS_PORT/0" ;;
+      rabbitmq)
+        echo "  in docker: rabbitmq:5672"
+        echo "  url:       amqp://$SBX_USER:$SBX_PASSWORD@$HOST:$RABBITMQ_PORT/%2F" ;;
+      mongo)
+        echo "  in docker: mongo:27017"
+        echo "  url:       mongodb://$SBX_USER:$SBX_PASSWORD@$HOST:$MONGO_PORT/<db>?authSource=admin" ;;
+      rustfs)
+        echo "  in docker: http://rustfs:9000"
+        echo "  access:    $SBX_USER / $SBX_PASSWORD" ;;
+      mailpit)
+        echo "  in docker: mailpit:1025 (smtp, no auth)" ;;
+      *)
+        echo "  in docker: $s:<container port>  (see $CUSTOM_DIR/$s.yaml)" ;;
+    esac
+  done
+}
+
+cmd_db() {
+  local action="${1:-}"; shift || true
+  local name="" engine=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --engine|-e) engine="$2"; shift 2 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  if [ -z "$engine" ]; then
+    if is_enabled postgres; then engine=postgres
+    elif is_enabled mysql; then engine=mysql
+    elif is_enabled mongo; then engine=mongo
+    else die "no database service enabled. Run: sbx up postgres"; fi
+  fi
+  case "$engine" in pg|postgresql) engine=postgres ;; mariadb) engine=mysql ;; mongodb) engine=mongo ;; esac
+
+  case "$action" in
+    list)
+      need_docker; require_running "$engine"
+      case "$engine" in
+        postgres) docker exec sbx-postgres psql -U "$SBX_USER" -d postgres -Atc "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY 1" ;;
+        mysql)    docker exec sbx-mysql mysql -uroot -p"$SBX_PASSWORD" -N -e "SHOW DATABASES" 2>/dev/null ;;
+        mongo)    docker exec sbx-mongo mongosh --quiet -u "$SBX_USER" -p "$SBX_PASSWORD" --authenticationDatabase admin --eval "db.adminCommand('listDatabases').databases.forEach(d=>print(d.name))" ;;
+      esac
+      return 0 ;;
+    create|drop) ;;
+    *) die "usage: sbx db <create|drop|list> <name> [--engine postgres|mysql|mongo]" ;;
+  esac
+
+  [ -n "$name" ] || die "missing database name"
+  name="$(norm_name "$name")"; validate_name "$name"
+  need_docker; require_running "$engine"
+
+  case "$engine:$action" in
+    postgres:create)
+      docker exec -i sbx-postgres psql -v ON_ERROR_STOP=1 -U "$SBX_USER" -d postgres >/dev/null <<SQL
+DO \$\$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$name') THEN
+    CREATE ROLE "$name" LOGIN PASSWORD '$SBX_PASSWORD';
+  END IF;
+END \$\$;
+SELECT 'CREATE DATABASE "$name" OWNER "$name"'
+ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '$name')\gexec
+SQL
+      res_add "postgres:db" "$name"
+      echo "postgresql://$name:$SBX_PASSWORD@$HOST:$POSTGRES_PORT/$name" ;;
+    postgres:drop)
+      docker exec sbx-postgres psql -U "$SBX_USER" -d postgres -c "DROP DATABASE IF EXISTS \"$name\" WITH (FORCE)" -c "DROP ROLE IF EXISTS \"$name\"" >/dev/null
+      res_del "postgres:db" "$name"; info "dropped postgres db + role $name" ;;
+    mysql:create)
+      docker exec sbx-mysql mysql -uroot -p"$SBX_PASSWORD" -e \
+        "CREATE DATABASE IF NOT EXISTS \`$name\`; CREATE USER IF NOT EXISTS '$name'@'%' IDENTIFIED BY '$SBX_PASSWORD'; GRANT ALL ON \`$name\`.* TO '$name'@'%'; FLUSH PRIVILEGES;" 2>/dev/null
+      res_add "mysql:db" "$name"
+      echo "mysql://$name:$SBX_PASSWORD@$HOST:$MYSQL_PORT/$name" ;;
+    mysql:drop)
+      docker exec sbx-mysql mysql -uroot -p"$SBX_PASSWORD" -e "DROP DATABASE IF EXISTS \`$name\`; DROP USER IF EXISTS '$name'@'%';" 2>/dev/null
+      res_del "mysql:db" "$name"; info "dropped mysql db + user $name" ;;
+    mongo:create)
+      docker exec sbx-mongo mongosh --quiet -u "$SBX_USER" -p "$SBX_PASSWORD" --authenticationDatabase admin "$name" \
+        --eval "if(!db.getUser('$name')){db.createUser({user:'$name',pwd:'$SBX_PASSWORD',roles:[{role:'dbOwner',db:'$name'}]})}" >/dev/null
+      res_add "mongo:db" "$name"
+      echo "mongodb://$name:$SBX_PASSWORD@$HOST:$MONGO_PORT/$name" ;;
+    mongo:drop)
+      docker exec sbx-mongo mongosh --quiet -u "$SBX_USER" -p "$SBX_PASSWORD" --authenticationDatabase admin "$name" \
+        --eval "db.dropUser('$name'); db.dropDatabase()" >/dev/null 2>&1 || true
+      res_del "mongo:db" "$name"; info "dropped mongo db $name" ;;
+    *) die "unsupported engine '$engine'" ;;
+  esac
+}
+
+cmd_vhost() {
+  local action="${1:-}" name="${2:-}"
+  [ -n "$name" ] || die "usage: sbx vhost <create|drop> <name>"
+  name="$(norm_name "$name")"; validate_name "$name"
+  need_docker; require_running rabbitmq
+  case "$action" in
+    create)
+      docker exec sbx-rabbitmq rabbitmqctl -q add_vhost "$name" >/dev/null 2>&1 || true
+      docker exec sbx-rabbitmq rabbitmqctl -q set_permissions -p "$name" "$SBX_USER" ".*" ".*" ".*" >/dev/null
+      res_add "rabbitmq:vhost" "$name"
+      echo "amqp://$SBX_USER:$SBX_PASSWORD@$HOST:$RABBITMQ_PORT/$name" ;;
+    drop)
+      docker exec sbx-rabbitmq rabbitmqctl -q delete_vhost "$name" >/dev/null 2>&1 || true
+      res_del "rabbitmq:vhost" "$name"; info "dropped vhost $name" ;;
+    *) die "usage: sbx vhost <create|drop> <name>" ;;
+  esac
+}
+
+cmd_bucket() {
+  local action="${1:-}" name="${2:-}"
+  [ -n "$name" ] || die "usage: sbx bucket <create|drop> <name>"
+  name="$(echo "$name" | tr '[:upper:]_' '[:lower:]-')"
+  echo "$name" | grep -Eq '^[a-z0-9][a-z0-9.-]{2,62}$' || die "invalid bucket name '$name'"
+  need_docker; require_running rustfs
+  # The rustfs image has no S3 client, so sign plain S3 calls with its bundled curl.
+  local s3="docker exec sbx-rustfs curl -fsS -o /dev/null --aws-sigv4 aws:amz:us-east-1:s3 --user $SBX_USER:$SBX_PASSWORD"
+  case "$action" in
+    create) $s3 -X PUT "http://127.0.0.1:9000/$name"; res_add "rustfs:bucket" "$name"; echo "s3://$name (endpoint http://$HOST:$RUSTFS_PORT)" ;;
+    drop)   $s3 -X DELETE -H "x-minio-force-delete: true" "http://127.0.0.1:9000/$name" 2>/dev/null || true; res_del "rustfs:bucket" "$name"; info "dropped bucket $name" ;;
+    *) die "usage: sbx bucket <create|drop> <name>" ;;
+  esac
+}
+
+# Print .env lines for a project, using the enabled services.
+cmd_env() {
+  local project="" docker_mode=0 a
+  for a in "$@"; do
+    case "$a" in --docker) docker_mode=1 ;; *) project="$a" ;; esac
+  done
+  [ -n "$project" ] || die "usage: sbx env <project> [--docker]"
+  local db; db="$(norm_name "$project")"
+  local bucket; bucket="$(echo "$project" | tr '[:upper:]_' '[:lower:]-')"
+  local h_pg h_my h_rd h_mq h_mg h_s3 h_ml p_pg p_my p_rd p_mq p_mg p_s3 p_ml
+  if [ $docker_mode -eq 1 ]; then
+    h_pg=postgres; h_my=mysql; h_rd=redis; h_mq=rabbitmq; h_mg=mongo; h_s3=rustfs; h_ml=mailpit
+    p_pg=5432; p_my=3306; p_rd=6379; p_mq=5672; p_mg=27017; p_s3=9000; p_ml=1025
+  else
+    h_pg=$HOST; h_my=$HOST; h_rd=$HOST; h_mq=$HOST; h_mg=$HOST; h_s3=$HOST; h_ml=$HOST
+    p_pg=$POSTGRES_PORT; p_my=$MYSQL_PORT; p_rd=$REDIS_PORT; p_mq=$RABBITMQ_PORT
+    p_mg=$MONGO_PORT; p_s3=$RUSTFS_PORT; p_ml=$MAILPIT_SMTP_PORT
+  fi
+  echo "# zen-sandbox env for '$project' ($([ $docker_mode -eq 1 ] && echo 'inside docker network sandbox' || echo 'from host'))"
+  is_enabled postgres && cat <<EOF
+DATABASE_URL=postgresql://$db:$SBX_PASSWORD@$h_pg:$p_pg/$db
+SPRING_DATASOURCE_URL=jdbc:postgresql://$h_pg:$p_pg/$db
+SPRING_DATASOURCE_USERNAME=$db
+SPRING_DATASOURCE_PASSWORD=$SBX_PASSWORD
+EOF
+  if is_enabled mysql && ! is_enabled postgres; then cat <<EOF
+DATABASE_URL=mysql://$db:$SBX_PASSWORD@$h_my:$p_my/$db
+SPRING_DATASOURCE_URL=jdbc:mysql://$h_my:$p_my/$db
+SPRING_DATASOURCE_USERNAME=$db
+SPRING_DATASOURCE_PASSWORD=$SBX_PASSWORD
+EOF
+  elif is_enabled mysql; then echo "MYSQL_URL=mysql://$db:$SBX_PASSWORD@$h_my:$p_my/$db"; fi
+  is_enabled redis && cat <<EOF
+REDIS_URL=redis://$h_rd:$p_rd/0
+SPRING_DATA_REDIS_HOST=$h_rd
+SPRING_DATA_REDIS_PORT=$p_rd
+EOF
+  is_enabled rabbitmq && cat <<EOF
+RABBITMQ_URL=amqp://$SBX_USER:$SBX_PASSWORD@$h_mq:$p_mq/$db
+SPRING_RABBITMQ_HOST=$h_mq
+SPRING_RABBITMQ_PORT=$p_mq
+SPRING_RABBITMQ_USERNAME=$SBX_USER
+SPRING_RABBITMQ_PASSWORD=$SBX_PASSWORD
+SPRING_RABBITMQ_VIRTUAL_HOST=$db
+EOF
+  is_enabled mongo && echo "MONGODB_URI=mongodb://$db:$SBX_PASSWORD@$h_mg:$p_mg/$db"
+  is_enabled rustfs && cat <<EOF
+S3_ENDPOINT=http://$h_s3:$p_s3
+S3_ACCESS_KEY=$SBX_USER
+S3_SECRET_KEY=$SBX_PASSWORD
+S3_BUCKET=$bucket
+S3_FORCE_PATH_STYLE=true
+EOF
+  is_enabled mailpit && cat <<EOF
+SMTP_HOST=$h_ml
+SMTP_PORT=$p_ml
+EOF
+  return 0
+}
+
+# One shot: create db / vhost / bucket for a project on every running service, then print env.
+cmd_project() {
+  local action="${1:-}" name="${2:-}"
+  [ "$action" = "init" ] || [ "$action" = "drop" ] || die "usage: sbx project <init|drop> <name> [--docker]"
+  [ -n "$name" ] || die "missing project name"
+  shift 2
+  need_docker
+  local verb=create; [ "$action" = "drop" ] && verb=drop
+  is_running postgres && cmd_db "$verb" "$name" --engine postgres >/dev/null
+  is_running mysql    && cmd_db "$verb" "$name" --engine mysql >/dev/null
+  is_running mongo    && cmd_db "$verb" "$name" --engine mongo >/dev/null
+  is_running rabbitmq && cmd_vhost "$verb" "$name" >/dev/null
+  is_running rustfs   && cmd_bucket "$verb" "$name" >/dev/null
+  if [ "$action" = "init" ]; then
+    info "project '$name' ready on: $(running_list | tr '\n' ' ')"
+    cmd_env "$name" "$@"
+  else
+    info "project '$name' resources dropped"
+  fi
+}
+
+cmd_resources() {
+  [ -s "$RES_FILE" ] || { echo "No project resources yet."; return 0; }
+  printf '%-16s %-24s %s\n' TYPE NAME CREATED
+  awk -F'\t' '{ printf "%-16s %-24s %s\n", $1, $2, $3 }' "$RES_FILE"
+}
+
+cmd_new() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: sbx new <service-name>"
+  echo "$name" | grep -Eq '^[a-z][a-z0-9-]{0,30}$' || die "invalid service name '$name'"
+  is_builtin "$name" && die "'$name' is a built-in service"
+  local f="$CUSTOM_DIR/$name.yaml"
+  [ -e "$f" ] && die "$f already exists"
+  sed "s/__NAME__/$name/g" "$SBX_ROOT/templates/custom-service.yaml" > "$f"
+  echo "$f"
+  info "edit image/ports in that file, then: sbx up $name"
+}
+
+cmd_delete_custom() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: sbx delete <custom-service> [--purge]"
+  is_builtin "$name" && die "cannot delete built-in service; use: sbx remove $name"
+  [ -f "$CUSTOM_DIR/$name.yaml" ] || die "no custom service '$name'"
+  cmd_remove "$@"
+  rm -f "$CUSTOM_DIR/$name.yaml"
+  info "deleted custom service definition $name"
+}
+
+cmd_logs() {
+  need_docker
+  [ $# -gt 0 ] || die "usage: sbx logs <service> [-f]"
+  compose logs --tail 100 "$@"
+}
+
+cmd_shell() {
+  need_docker
+  local s="${1:-}"; [ -n "$s" ] || die "usage: sbx shell <service> [db]"
+  require_running "$s"
+  local tty="-i"; [ -t 0 ] && tty="-it"
+  case "$s" in
+    postgres) docker exec $tty sbx-postgres psql -U "$SBX_USER" -d "${2:-postgres}" ;;
+    mysql)    docker exec $tty sbx-mysql mysql -uroot -p"$SBX_PASSWORD" ${2:+"$2"} ;;
+    redis)    docker exec $tty sbx-redis redis-cli ;;
+    mongo)    docker exec $tty sbx-mongo mongosh -u "$SBX_USER" -p "$SBX_PASSWORD" --authenticationDatabase admin ${2:+"$2"} ;;
+    rabbitmq) docker exec $tty sbx-rabbitmq sh ;;
+    *)        docker exec $tty "sbx-$s" sh ;;
+  esac
+}
+
+# Host port variables of a built-in service (main port first).
+port_vars() {
+  case "$1" in
+    postgres) echo POSTGRES_PORT ;;  mysql) echo MYSQL_PORT ;;
+    redis)    echo REDIS_PORT ;;     mongo) echo MONGO_PORT ;;
+    rabbitmq) echo "RABBITMQ_PORT RABBITMQ_UI_PORT" ;;
+    rustfs)   echo "RUSTFS_PORT RUSTFS_UI_PORT" ;;
+    mailpit)  echo "MAILPIT_SMTP_PORT MAILPIT_UI_PORT" ;;
+  esac
+}
+port_free() { ! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+# Who listens on a host port: a docker container, a swarm service, else a local process.
+# Empty if unknown. Handles published ranges like "*:9000-9001->9000-9001/tcp".
+port_owner() {
+  local o
+  o="$( { docker ps --format 'container\t{{.Names}}\t{{.Ports}}' 2>/dev/null
+          docker service ls --format 'swarm service\t{{.Name}}\t{{.Ports}}' 2>/dev/null; } \
+    | awk -F'\t' -v p="$1" '{
+        n = split($3, a, ", ")
+        for (i = 1; i <= n; i++) {
+          if (index(a[i], "->") == 0) continue
+          h = a[i]; sub(/->.*/, "", h); sub(/.*:/, "", h)
+          m = split(h, r, "-"); lo = r[1] + 0; hi = (m > 1 ? r[2] : r[1]) + 0
+          if (p + 0 >= lo && p + 0 <= hi) { print $1 " " $2; exit }
+        }
+      }')"
+  if [ -z "$o" ] && command -v lsof >/dev/null 2>&1; then
+    o="$(lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | awk 'NR==2 { print "process " $1 " (pid " $2 ")" }')"
+  fi
+  echo "$o"
+}
+# Print the busy host ports of services that are not running (args: services).
+report_busy_ports() {
+  local s v p o
+  for s in "$@"; do
+    is_builtin "$s" || continue
+    is_running "$s" && continue
+    for v in $(port_vars "$s"); do
+      p="$(eval "echo \$$v")"
+      port_free "$p" && continue
+      o="$(port_owner "$p")"
+      info "$s: port $p ($v) is in use${o:+ by $o}. Fix: sbx port $s auto"
+    done
+  done
+}
+# True if another sandbox port variable already has this value.
+port_taken() {
+  local s v
+  for s in $BUILTIN; do
+    for v in $(port_vars "$s"); do
+      [ "$v" != "$2" ] && [ "$(eval "echo \$$v")" = "$1" ] && return 0
+    done
+  done
+  return 1
+}
+set_env_var() {
+  local tmp; tmp="$(mktemp)"
+  grep -v "^$1=" "$ENV_FILE" > "$tmp" || true
+  echo "$1=$2" >> "$tmp"
+  mv "$tmp" "$ENV_FILE"
+  eval "$1=\$2"
+}
+
+# Show or change host ports. `auto` picks the next free port.
+cmd_port() {
+  local s="${1:-}" v cur want changed=0 note o
+  if [ -z "$s" ]; then
+    for s in $BUILTIN; do
+      for v in $(port_vars "$s"); do
+        cur="$(eval "echo \$$v")"; note=""
+        if is_running "$s"; then note="running"
+        elif ! port_free "$cur"; then o="$(port_owner "$cur")"; note="IN USE${o:+ by $o}"; fi
+        printf '%-10s %-18s %-6s %s\n' "$s" "$v" "$cur" "$note"
+      done
+    done
+    return 0
+  fi
+  is_builtin "$s" || die "sbx port works for built-in services; for a custom one edit $CUSTOM_DIR/$s.yaml"
+  shift
+  [ $# -gt 0 ] || { echo "$(svc_endpoint "$s")"; return 0; }
+  for v in $(port_vars "$s"); do
+    want="${1:-}"; shift || true
+    [ -n "$want" ] || continue
+    cur="$(eval "echo \$$v")"
+    if [ "$want" = "auto" ]; then
+      want="$cur"
+      if ! is_running "$s"; then
+        if ! port_free "$want"; then o="$(port_owner "$want")"; info "port $want is in use${o:+ by $o}"; fi
+        while ! port_free "$want" || port_taken "$want" "$v"; do want=$((want + 1)); done
+      fi
+    else
+      echo "$want" | grep -Eq '^[0-9]{2,5}$' || die "invalid port '$want'"
+      port_taken "$want" "$v" && die "port $want is already used by another sandbox service (see: sbx port)"
+    fi
+    [ "$want" = "$cur" ] && continue
+    set_env_var "$v" "$want"; changed=1
+    info "$v: $cur -> $want"
+  done
+  if [ $changed -eq 1 ] && is_running "$s"; then need_docker; compose up -d --wait "$s"; fi
+  echo "$s: $(svc_endpoint "$s")"
+}
+
+# Short markdown summary. Used by the Claude Code SessionStart hook.
+cmd_context() {
+  local en run stopped s
+  echo "## Local dev sandbox (zen-sandbox)"
+  echo "Shared dev services run in one Docker Compose project \`sandbox\` (network \`sandbox\`)."
+  echo "For new/local projects REUSE these services instead of adding postgres/redis/rabbitmq/etc. to the project's own docker-compose."
+  echo "Manage with the \`sbx\` CLI (see the \`sandbox\` skill). CLI path: $SBX_SELF_DIR/sbx"
+  command -v sbx >/dev/null 2>&1 || echo "Note: \`sbx\` is not on PATH; call it by full path or run $SBX_ROOT/install.sh."
+  if ! docker_ok; then
+    echo "Status: Docker daemon not reachable right now."
+    return 0
+  fi
+  en="$(enabled_list | tr '\n' ' ')"
+  run=""; stopped=""
+  for s in $en; do
+    if is_running "$s"; then run="$run $s ($(svc_endpoint "$s"));"
+    else stopped="$stopped $s"; fi
+  done
+  echo "Running:${run:- none}"
+  [ -n "$stopped" ] && echo "Enabled but stopped:$stopped (start with \`sbx up\`)"
+  echo "Host ports above are the real ones (they can differ from the defaults). Port already in use: \`sbx port <service> auto\`."
+  echo "Default creds: $SBX_USER / $SBX_PASSWORD. Per-project resources: \`sbx project init <name>\`; env vars: \`sbx env <name> [--docker]\`."
+  if [ -s "$RES_FILE" ]; then
+    echo "Existing project resources: $(awk -F'\t' '{ printf "%s%s=%s", (NR>1?", ":""), $1, $2 }' "$RES_FILE")"
+  fi
+  return 0
+}
+
+# Write/remove a managed block in ~/.claude/CLAUDE.md (for users without the plugin).
+cmd_claude() {
+  local action="${1:-install}" f="$HOME/.claude/CLAUDE.md"
+  local begin="<!-- zen-sandbox:begin -->" end="<!-- zen-sandbox:end -->"
+  mkdir -p "$HOME/.claude"; touch "$f"
+  local tmp; tmp="$(mktemp)"
+  awk -v b="$begin" -v e="$end" '$0==b{skip=1} !skip{print} $0==e{skip=0}' "$f" > "$tmp"
+  if [ "$action" = "install" ]; then
+    {
+      cat "$tmp"
+      echo "$begin"
+      cat <<EOF
+## Local dev sandbox (zen-sandbox)
+- Shared local services (postgres, mysql, redis, rabbitmq, mongo, rustfs, mailpit, + custom) run in the Docker Compose project \`sandbox\`, network \`sandbox\`.
+- For any local development, REUSE them. Do not add these services to a project's own docker-compose.
+- Run \`sbx context\` at the start of infra-related work to see what is running.
+- New project: \`sbx project init <name>\` (creates db/vhost/bucket) then \`sbx env <name>\` (or \`--docker\` for containers on the \`sandbox\` network) into the project's .env.
+- Port already in use: \`sbx port <service> auto\`, then \`sbx up <service>\`. Real ports: \`sbx context\` or \`sbx info\`.
+- Need a service that is not running: \`sbx up <service>\`. Not in the catalog: \`sbx new <name>\`, edit ~/.sandbox/services/<name>.yaml, \`sbx up <name>\`.
+- Never \`sbx remove --purge\` or \`sbx db drop\` without asking the user first (it deletes data).
+EOF
+      echo "$end"
+    } > "$f"
+    rm -f "$tmp"
+    info "updated $f"
+  else
+    mv "$tmp" "$f"; info "removed zen-sandbox block from $f"
+  fi
+}
+
+usage() {
+  cat <<EOF
+sbx — shared local dev sandbox (Docker Compose project "sandbox")
+
+Services
+  sbx list                       catalog with enabled/running state
+  sbx up [svc...]                enable + start services (no args: start all enabled)
+  sbx stop [svc...]              stop (keeps them enabled)
+  sbx restart [svc...]
+  sbx remove <svc...> [--purge]  stop + disable; --purge also deletes data volume
+  sbx status                     container status
+  sbx info [svc...]              endpoints, credentials, connection strings
+  sbx port [svc] [port|auto] [ui-port|auto]   show or change host ports (auto = next free)
+  sbx logs <svc> [-f]
+  sbx shell <svc> [db]           psql / mysql / redis-cli / mongosh / sh
+
+Project resources
+  sbx project init <name> [--docker]   create db/vhost/bucket on running services + print env
+  sbx project drop <name>
+  sbx db <create|drop|list> <name> [--engine postgres|mysql|mongo]
+  sbx vhost <create|drop> <name>       RabbitMQ virtual host
+  sbx bucket <create|drop> <name>      RustFS bucket
+  sbx env <name> [--docker]            .env lines for a project
+  sbx resources                        resources created via sbx
+
+Custom services
+  sbx new <name>                 scaffold ~/.sandbox/services/<name>.yaml
+  sbx delete <name> [--purge]    remove a custom service definition
+
+Claude
+  sbx context                    short summary (used by the Claude Code hook)
+  sbx claude [install|uninstall] add/remove sandbox rules in ~/.claude/CLAUDE.md
+
+Config: $ENV_FILE   Data: docker volumes sbx-<svc>-data
+EOF
+}
+
+main() {
+  init_home
+  load_env
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    up|start)        cmd_up "$@" ;;
+    stop)            cmd_stop "$@" ;;
+    restart)         cmd_restart "$@" ;;
+    remove|rm)       cmd_remove "$@" ;;
+    status|ps)       cmd_status ;;
+    list|ls)         cmd_list ;;
+    info)            cmd_info "$@" ;;
+    port|ports)      cmd_port "$@" ;;
+    logs)            cmd_logs "$@" ;;
+    shell|sh)        cmd_shell "$@" ;;
+    db)              cmd_db "$@" ;;
+    vhost)           cmd_vhost "$@" ;;
+    bucket)          cmd_bucket "$@" ;;
+    env)             cmd_env "$@" ;;
+    project)         cmd_project "$@" ;;
+    resources|res)   cmd_resources ;;
+    new)             cmd_new "$@" ;;
+    delete)          cmd_delete_custom "$@" ;;
+    context)         cmd_context ;;
+    claude)          cmd_claude "$@" ;;
+    compose)         compose "$@" ;;
+    help|-h|--help)  usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+main "$@"

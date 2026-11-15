@@ -1,0 +1,126 @@
+# zen-sandbox — shared local dev services.
+# Every service sits behind a profile, so only the services you enable start.
+# Manage with `sbx` instead of calling docker compose directly.
+name: sandbox
+
+x-common: &common
+  restart: unless-stopped
+  networks: [sandbox]
+  labels:
+    sbx.managed: "true"
+
+networks:
+  sandbox:
+    name: sandbox
+
+services:
+  postgres:
+    <<: *common
+    profiles: [postgres]
+    image: postgres:${POSTGRES_VERSION:-17}-alpine
+    container_name: sbx-postgres
+    environment:
+      POSTGRES_USER: ${SBX_USER:-sandbox}
+      POSTGRES_PASSWORD: ${SBX_PASSWORD:-sandbox123}
+    ports: ["${SBX_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"]
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      retries: 20
+
+  mysql:
+    <<: *common
+    profiles: [mysql]
+    image: mysql:${MYSQL_VERSION:-8.4}
+    container_name: sbx-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${SBX_PASSWORD:-sandbox123}
+      MYSQL_USER: ${SBX_USER:-sandbox}
+      MYSQL_PASSWORD: ${SBX_PASSWORD:-sandbox123}
+    ports: ["${SBX_BIND:-127.0.0.1}:${MYSQL_PORT:-3306}:3306"]
+    volumes: [mysql-data:/var/lib/mysql]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      retries: 30
+
+  redis:
+    <<: *common
+    profiles: [redis]
+    image: redis:${REDIS_VERSION:-7}-alpine
+    container_name: sbx-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["${SBX_BIND:-127.0.0.1}:${REDIS_PORT:-6379}:6379"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20
+
+  rabbitmq:
+    <<: *common
+    profiles: [rabbitmq]
+    image: rabbitmq:${RABBITMQ_VERSION:-4}-management-alpine
+    container_name: sbx-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${SBX_USER:-sandbox}
+      RABBITMQ_DEFAULT_PASS: ${SBX_PASSWORD:-sandbox123}
+    ports:
+      - "${SBX_BIND:-127.0.0.1}:${RABBITMQ_PORT:-5672}:5672"
+      - "${SBX_BIND:-127.0.0.1}:${RABBITMQ_UI_PORT:-15672}:15672"
+    volumes: [rabbitmq-data:/var/lib/rabbitmq]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      retries: 20
+
+  mongo:
+    <<: *common
+    profiles: [mongo]
+    image: mongo:${MONGO_VERSION:-8}
+    container_name: sbx-mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${SBX_USER:-sandbox}
+      MONGO_INITDB_ROOT_PASSWORD: ${SBX_PASSWORD:-sandbox123}
+    ports: ["${SBX_BIND:-127.0.0.1}:${MONGO_PORT:-27017}:27017"]
+    volumes: [mongo-data:/data/db]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      retries: 20
+
+  rustfs:
+    <<: *common
+    profiles: [rustfs]
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:latest}
+    container_name: sbx-rustfs
+    environment:
+      RUSTFS_ACCESS_KEY: ${SBX_USER:-sandbox}
+      RUSTFS_SECRET_KEY: ${SBX_PASSWORD:-sandbox123}
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "${SBX_BIND:-127.0.0.1}:${RUSTFS_PORT:-9000}:9000"
+      - "${SBX_BIND:-127.0.0.1}:${RUSTFS_UI_PORT:-9001}:9001"
+    volumes: [rustfs-data:/data]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      retries: 20
+
+  mailpit:
+    <<: *common
+    profiles: [mailpit]
+    image: axllent/mailpit:latest
+    container_name: sbx-mailpit
+    ports:
+      - "${SBX_BIND:-127.0.0.1}:${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "${SBX_BIND:-127.0.0.1}:${MAILPIT_UI_PORT:-8025}:8025"
+
+volumes:
+  postgres-data: { name: sbx-postgres-data }
+  mysql-data:    { name: sbx-mysql-data }
+  redis-data:    { name: sbx-redis-data }
+  rabbitmq-data: { name: sbx-rabbitmq-data }
+  mongo-data:    { name: sbx-mongo-data }
+  rustfs-data:    { name: sbx-rustfs-data }

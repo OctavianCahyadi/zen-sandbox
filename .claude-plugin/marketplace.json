@@ -1,0 +1,11 @@
+{
+  "name": "zenbytes",
+  "owner": { "name": "Zenbytes" },
+  "plugins": [
+    {
+      "name": "zen-sandbox",
+      "source": "./",
+      "description": "Shared local dev sandbox managed by the sbx CLI"
+    }
+  ]
+}
