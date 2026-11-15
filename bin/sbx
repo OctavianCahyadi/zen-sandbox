@@ -483,6 +483,147 @@ cmd_shell() {
   esac
 }
 
+# ---------- migration of old per-project stacks ----------
+# Map an image or volume name to a sandbox engine. Empty = not an infra service.
+engine_of() {
+  case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
+    *postgres*|*postgis*|*timescale*|*pgvector*|*pgdata*|*pg_data*|*pg-data*) echo postgres ;;
+    *mysql*|*mariadb*) echo mysql ;;
+    *redis*|*valkey*)  echo redis ;;
+    *rabbit*)          echo rabbitmq ;;
+    *mongo*)           echo mongo ;;
+    *minio*|*seaweed*|*localstack*) echo s3 ;;
+    *mailpit*|*mailhog*) echo mail ;;
+  esac
+}
+
+# Read-only: list infra containers and data volumes that belong to other stacks.
+cmd_scan() {
+  need_docker
+  local proj name image state dir eng found=0
+  echo "Infra containers outside the sandbox (duplicates of sandbox services):"
+  printf '  %-18s %-9s %-30s %-9s %-28s %s\n' PROJECT ENGINE CONTAINER STATE IMAGE FOLDER
+  while IFS='	' read -r proj name image state dir; do
+    [ -n "$proj" ] && [ "$proj" != "sandbox" ] || continue
+    eng="$(engine_of "$image")"; [ -n "$eng" ] || continue
+    printf '  %-18s %-9s %-30s %-9s %-28s %s\n' "$proj" "$eng" "$name" "$state" "$image" "${dir:--}"
+    found=1
+  done <<EOF
+$(docker ps -a --format '{{or (.Label "com.docker.compose.project") (.Label "com.docker.stack.namespace")}}	{{.Names}}	{{.Image}}	{{.State}}	{{.Label "com.docker.compose.project.working_dir"}}' | sort)
+EOF
+  [ $found -eq 1 ] || echo "  (none)"
+  echo
+  echo "Data volumes of other stacks (engine guessed from the volume name; these survive 'compose down'):"
+  printf '  %-18s %-9s %s\n' PROJECT ENGINE VOLUME
+  found=0
+  while IFS='	' read -r proj name; do
+    [ -n "$proj" ] && [ "$proj" != "sandbox" ] || continue
+    eng="$(engine_of "$name")"; [ -n "$eng" ] || continue
+    printf '  %-18s %-9s %s\n' "$proj" "$eng" "$name"
+    found=1
+  done <<EOF
+$(docker volume ls --format '{{or (.Label "com.docker.compose.project") (.Label "com.docker.stack.namespace")}}	{{.Name}}' | sort)
+EOF
+  [ $found -eq 1 ] || echo "  (none)"
+  echo
+  echo "Nothing was changed. To move one project into the sandbox, follow 'Migrating an existing project' in the sandbox skill."
+}
+
+# Value of an env var set on a container (empty if not set).
+cenv() { docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null | sed -n "s/^$2=//p" | head -1; }
+src_running() {
+  [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ] \
+    || die "source container '$1' is not running. Start the old project's service first (docker compose up -d <service> in its folder)."
+}
+
+# Copy data from an old container into the sandbox. The source is only read.
+cmd_import() {
+  local kind="${1:-}"; shift || true
+  case "$kind" in
+    postgres|pg) import_postgres "$@" ;;
+    bucket|s3)   import_bucket "$@" ;;
+    *) die "usage: sbx import postgres <container> <project> [--db <name>] [--user <name>]
+       sbx import bucket <container> [<bucket> [<target-bucket>]]" ;;
+  esac
+}
+
+import_postgres() {
+  local src="" project="" sdb="" suser=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --db) sdb="$2"; shift 2 ;;
+      --user) suser="$2"; shift 2 ;;
+      *) if [ -z "$src" ]; then src="$1"; else project="$1"; fi; shift ;;
+    esac
+  done
+  [ -n "$project" ] || die "usage: sbx import postgres <container> <project> [--db <name>] [--user <name>]"
+  need_docker; require_running postgres; src_running "$src"
+  [ -n "$suser" ] || suser="$(cenv "$src" POSTGRES_USER)"; : "${suser:=postgres}"
+  [ -n "$sdb" ] || sdb="$(cenv "$src" POSTGRES_DB)"; : "${sdb:=$suser}"
+  local spw; spw="$(cenv "$src" POSTGRES_PASSWORD)"
+  local name; name="$(norm_name "$project")"; validate_name "$name"
+  local count="SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema')"
+  local sver tver stab ttab ext e log errs
+  sver="$(docker exec -e PGPASSWORD="$spw" "$src" psql -U "$suser" -d "$sdb" -Atc "SHOW server_version_num")" \
+    || die "cannot connect to database '$sdb' as '$suser' in $src (try --db / --user)"
+  tver="$(docker exec sbx-postgres psql -U "$SBX_USER" -d postgres -Atc "SHOW server_version_num")"
+  [ $((sver / 10000)) -le $((tver / 10000)) ] \
+    || die "source is PostgreSQL $((sver / 10000)) but the sandbox is $((tver / 10000)). Raise POSTGRES_VERSION in $ENV_FILE first."
+  cmd_db create "$name" --engine postgres >/dev/null
+  ttab="$(docker exec sbx-postgres psql -U "$SBX_USER" -d "$name" -Atc "$count")"
+  [ "$ttab" = "0" ] || die "sandbox database '$name' already has $ttab tables. Drop it first: sbx db drop $name --engine postgres"
+  ext="$(docker exec -e PGPASSWORD="$spw" "$src" psql -U "$suser" -d "$sdb" -Atc "SELECT extname FROM pg_extension WHERE extname <> 'plpgsql'")"
+  for e in $ext; do
+    docker exec sbx-postgres psql -U "$SBX_USER" -d "$name" -qc "CREATE EXTENSION IF NOT EXISTS \"$e\"" >/dev/null 2>&1 \
+      || die "the source uses extension '$e', which the sandbox postgres image does not have. Keep this project on its own postgres, or run the sandbox with an image that has it."
+  done
+  log="$SBX_HOME/import-$name.log"
+  info "copying $src/$sdb (PostgreSQL $((sver / 10000))) -> sandbox database '$name' (PostgreSQL $((tver / 10000)))"
+  docker exec -e PGPASSWORD="$spw" "$src" pg_dump -U "$suser" -d "$sdb" --no-owner --no-acl \
+    | docker exec -i sbx-postgres psql -U "$name" -d "$name" -q >/dev/null 2>"$log" || true
+  # "must be owner of extension" comes from COMMENT ON EXTENSION and is harmless.
+  errs="$(grep 'ERROR' "$log" | grep -vc 'must be owner of extension' || true)"
+  stab="$(docker exec -e PGPASSWORD="$spw" "$src" psql -U "$suser" -d "$sdb" -Atc "$count")"
+  ttab="$(docker exec sbx-postgres psql -U "$SBX_USER" -d "$name" -Atc "$count")"
+  echo "tables: source $stab, sandbox $ttab; restore errors: $errs (log: $log)"
+  [ "$stab" = "$ttab" ] || die "table count differs. Read the log, fix, then: sbx db drop $name --engine postgres and import again."
+  echo "postgresql://$name:$SBX_PASSWORD@$HOST:$POSTGRES_PORT/$name"
+}
+
+import_bucket() {
+  local src="${1:-}" bucket="${2:-}" dst="${3:-}"
+  [ -n "$src" ] || die "usage: sbx import bucket <container> [<bucket> [<target-bucket>]]"
+  need_docker; require_running rustfs; src_running "$src"
+  local u p joined=0 rc=0
+  u="$(cenv "$src" MINIO_ROOT_USER)"; [ -n "$u" ] || u="$(cenv "$src" MINIO_ACCESS_KEY)"; : "${u:=minioadmin}"
+  p="$(cenv "$src" MINIO_ROOT_PASSWORD)"; [ -n "$p" ] || p="$(cenv "$src" MINIO_SECRET_KEY)"; : "${p:=minioadmin}"
+  if [ -n "$bucket" ]; then
+    [ -n "$dst" ] || dst="$bucket"
+    dst="$(echo "$dst" | tr '[:upper:]_' '[:lower:]-')"
+  fi
+  # Copy with a throwaway rclone container on the sandbox network. The old container
+  # joins that network for the copy only, so rclone can reach both S3 servers.
+  docker network connect sandbox "$src" >/dev/null 2>&1 && joined=1
+  local rc_run="docker run --rm --network sandbox -e RCLONE_LOG_LEVEL=ERROR
+    -e RCLONE_CONFIG_OLD_TYPE=s3 -e RCLONE_CONFIG_OLD_PROVIDER=Minio
+    -e RCLONE_CONFIG_OLD_ENDPOINT=http://$src:9000
+    -e RCLONE_CONFIG_OLD_ACCESS_KEY_ID=$u -e RCLONE_CONFIG_OLD_SECRET_ACCESS_KEY=$p
+    -e RCLONE_CONFIG_NEW_TYPE=s3 -e RCLONE_CONFIG_NEW_PROVIDER=Other
+    -e RCLONE_CONFIG_NEW_ENDPOINT=http://rustfs:9000
+    -e RCLONE_CONFIG_NEW_ACCESS_KEY_ID=$SBX_USER -e RCLONE_CONFIG_NEW_SECRET_ACCESS_KEY=$SBX_PASSWORD
+    ${RCLONE_IMAGE:-rclone/rclone:latest}"
+  if [ -z "$bucket" ]; then
+    $rc_run lsd old: || rc=1
+  else
+    # Create the target only after the source bucket is proven readable.
+    $rc_run lsf --max-depth 1 "old:$bucket" >/dev/null 2>&1 && cmd_bucket create "$dst" >/dev/null \
+      && $rc_run sync "old:$bucket" "new:$dst" && $rc_run check "old:$bucket" "new:$dst" >/dev/null 2>&1 || rc=1
+  fi
+  [ $joined -eq 1 ] && docker network disconnect sandbox "$src" >/dev/null 2>&1
+  [ $rc -eq 0 ] || die "could not read or copy from the S3 server in $src (check its access key / secret)"
+  [ -z "$bucket" ] || echo "s3://$dst (endpoint http://$HOST:$RUSTFS_PORT)"
+}
+
 # Host port variables of a built-in service (main port first).
 port_vars() {
   case "$1" in
@@ -668,6 +809,11 @@ Project resources
   sbx env <name> [--docker]            .env lines for a project
   sbx resources                        resources created via sbx
 
+Migrate old per-project stacks (source data is only read)
+  sbx scan                             infra containers / data volumes of other stacks
+  sbx import postgres <container> <project> [--db <name>] [--user <name>]
+  sbx import bucket <container> [<bucket> [<target-bucket>]]   MinIO -> RustFS
+
 Custom services
   sbx new <name>                 scaffold ~/.sandbox/services/<name>.yaml
   sbx delete <name> [--purge]    remove a custom service definition
@@ -701,6 +847,8 @@ main() {
     env)             cmd_env "$@" ;;
     project)         cmd_project "$@" ;;
     resources|res)   cmd_resources ;;
+    scan)            cmd_scan ;;
+    import)          cmd_import "$@" ;;
     new)             cmd_new "$@" ;;
     delete)          cmd_delete_custom "$@" ;;
     context)         cmd_context ;;

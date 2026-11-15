@@ -115,6 +115,26 @@ never has to guess. Ports inside the `sandbox` network do not change (`rustfs:90
 `postgres:5432`, ...). `sbx port` covers built-in services; for a custom service edit
 its yaml.
 
+### Migrate old projects
+
+Already have projects that each run their own postgres / redis / minio? Tell Claude
+"migrate this project to the sandbox" and it follows the playbook in the skill:
+find the old stack, copy the data, rewire the project's compose and `.env`, test,
+and ask you before any old container or volume is removed.
+
+```bash
+sbx scan                                        # old infra containers and data volumes (read-only)
+sbx import postgres myapp-db-1 myapp            # dump old container -> sandbox database "myapp"
+sbx import bucket myapp-minio-1                 # list buckets in an old MinIO
+sbx import bucket myapp-minio-1 uploads myapp   # copy bucket "uploads" -> RustFS bucket "myapp"
+```
+
+The source is only read, so the old stack keeps working if a migration fails.
+`import postgres` refuses a newer source version, a non-empty target, and extensions
+the sandbox image does not have, and compares table counts after the copy. Bucket
+copies run through a throwaway `rclone/rclone` container. MySQL and Mongo have no
+import command yet.
+
 ### Custom services
 
 ```bash
