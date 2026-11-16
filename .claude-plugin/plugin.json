@@ -1,6 +1,5 @@
 {
   "name": "zen-sandbox",
-  "version": "0.1.0",
   "description": "Shared local dev sandbox (postgres, mysql, redis, rabbitmq, mongo, rustfs, mailpit, custom) managed with the sbx CLI. Claude knows what is running at every session start.",
   "author": { "name": "Zenbytes" },
   "license": "MIT",
