@@ -1,5 +1,7 @@
 # zen-sandbox
 
+![zen-sandbox: one shared local Docker stack for all your dev projects](.github/social-preview.png)
+
 [![ci](https://github.com/OctavianCahyadi/zen-sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/OctavianCahyadi/zen-sandbox/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -71,9 +73,9 @@ claude plugin marketplace update zenbytes      # refresh the plugin catalog
 claude plugin update zen-sandbox@zenbytes      # pull the new plugin version
 ```
 
-Start a new Claude Code session afterwards. Updates are not automatic unless you turn
-on auto-update for the `zenbytes` marketplace (`/plugin` → Marketplaces in a terminal
-session). A marketplace added from a local path needs only the `git pull`. Your data
+Start a new Claude Code session afterwards (or run `/reload-plugins` in an open one).
+Updates are not automatic unless you turn on auto-update for the `zenbytes` marketplace
+(`/plugin` → Marketplaces → zenbytes → Enable auto-update in a terminal session). A marketplace added from a local path needs only the `git pull`. Your data
 and `~/.sandbox` are not touched by an update.
 
 ### Uninstall
@@ -104,6 +106,7 @@ sbx shell postgres myapp          # psql
 sbx stop                          # stop everything (keeps enabled list)
 sbx remove rabbitmq               # disable, keep data
 sbx remove rabbitmq --purge       # disable + delete data
+sbx help                          # every command
 ```
 
 App in a container → join the shared network:
@@ -121,8 +124,8 @@ networks:
 
 ### Ports
 
-Other stacks on the machine are never touched and never listed, but they can hold a
-port the sandbox wants. `sbx port` shows every host port and names the owner of a busy
+Other stacks on the machine are never touched, and `sbx list` / `sbx status` show only
+the sandbox, but another stack can hold a port the sandbox wants. `sbx port` shows every host port and names the owner of a busy
 one (container, swarm service or local process):
 
 ```text
@@ -160,7 +163,8 @@ sbx import bucket myapp-minio-1                 # list buckets in an old MinIO
 sbx import bucket myapp-minio-1 uploads myapp   # copy bucket "uploads" -> RustFS bucket "myapp"
 ```
 
-The source is only read, so the old stack keeps working if a migration fails.
+The source data is only read, so the old stack keeps working if a migration fails
+(for a bucket copy the old container joins the `sandbox` network during the copy).
 `import postgres` refuses a newer source version, a non-empty target, and extensions
 the sandbox image does not have, and compares table counts after the copy. Bucket
 copies run through a throwaway `rclone/rclone` container. MySQL and Mongo have no
@@ -181,6 +185,9 @@ sbx up elasticsearch
 Edit `~/.sandbox/.env` for credentials, bind address and versions, then `sbx up`.
 Change ports with `sbx port` (it writes the same file).
 Defaults: user `sandbox`, password `sandbox123`, ports bound to `127.0.0.1`.
+Databases and RabbitMQ read the user and password only when their data volume is first
+created, so set them before the first `sbx up` (or `sbx remove <service> --purge` and
+start again, which deletes that service's data).
 
 ## Notes
 
