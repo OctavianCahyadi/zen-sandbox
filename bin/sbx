@@ -58,7 +58,10 @@ EOF
 }
 
 load_env() {
-  set -a; . "$ENV_FILE"; set +a
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
   : "${SBX_USER:=sandbox}" "${SBX_PASSWORD:=sandbox123}" "${SBX_BIND:=127.0.0.1}"
   : "${POSTGRES_PORT:=5432}" "${MYSQL_PORT:=3306}" "${REDIS_PORT:=6379}"
   : "${RABBITMQ_PORT:=5672}" "${RABBITMQ_UI_PORT:=15672}" "${MONGO_PORT:=27017}"
@@ -160,6 +163,7 @@ cmd_up() {
     compose up -d --wait "$@" || { report_busy_ports "$@"; die "start failed. If a port is already in use: sbx port <service> auto"; }
   else
     [ -n "$(enabled_list)" ] || die "nothing enabled yet. Example: sbx up postgres redis"
+    # shellcheck disable=SC2046
     compose up -d --wait || { report_busy_ports $(enabled_list); die "start failed. If a port is already in use: sbx port <service> auto"; }
   fi
   cmd_status
@@ -611,7 +615,7 @@ import_bucket() {
     -e RCLONE_CONFIG_NEW_TYPE=s3 -e RCLONE_CONFIG_NEW_PROVIDER=Other
     -e RCLONE_CONFIG_NEW_ENDPOINT=http://rustfs:9000
     -e RCLONE_CONFIG_NEW_ACCESS_KEY_ID=$SBX_USER -e RCLONE_CONFIG_NEW_SECRET_ACCESS_KEY=$SBX_PASSWORD
-    ${RCLONE_IMAGE:-rclone/rclone:latest}"
+    ${RCLONE_IMAGE:-rclone/rclone:1.76}"
   if [ -z "$bucket" ]; then
     $rc_run lsd old: || rc=1
   else

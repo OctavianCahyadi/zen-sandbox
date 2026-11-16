@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning bin/sbx install.sh hooks/session-start.sh tests/smoke.sh
+      - name: bash syntax
+        run: bash -n bin/sbx
+      - name: compose file is valid
+        run: docker compose -f compose.yaml --profile postgres --profile mysql --profile redis --profile rabbitmq --profile mongo --profile rustfs --profile mailpit config --quiet
+      - name: plugin manifests are valid JSON
+        run: |
+          python3 -m json.tool .claude-plugin/plugin.json > /dev/null
+          python3 -m json.tool .claude-plugin/marketplace.json > /dev/null
+          python3 -m json.tool hooks/hooks.json > /dev/null
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: end-to-end smoke test
+        run: bash tests/smoke.sh

@@ -1,5 +1,8 @@
 # zen-sandbox
 
+[![ci](https://github.com/OctavianCahyadi/zen-sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/OctavianCahyadi/zen-sandbox/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 One shared local Docker stack for all your dev projects, plus a Claude Code plugin so
 every Claude session knows what is running and how to use it.
 
@@ -27,6 +30,8 @@ State lives in `~/.sandbox/` (`.env`, `enabled`, `resources.tsv`, `services/*.ya
 Data lives in Docker volumes `sbx-<service>-data`, so updating the repo never touches data.
 
 ## Install
+
+Needs bash, Docker and Docker Compose v2.20+.
 
 ```bash
 git clone https://github.com/OctavianCahyadi/zen-sandbox ~/.zen-sandbox
@@ -57,6 +62,32 @@ infra or start a new project.
 sbx claude install     # writes a managed block into ~/.claude/CLAUDE.md
 sbx claude uninstall   # removes it
 ```
+
+### Update
+
+```bash
+git -C ~/.zen-sandbox pull                     # the sbx CLI and compose file
+claude plugin marketplace update zenbytes      # refresh the plugin catalog
+claude plugin update zen-sandbox@zenbytes      # pull the new plugin version
+```
+
+Start a new Claude Code session afterwards. Updates are not automatic unless you turn
+on auto-update for the `zenbytes` marketplace (`/plugin` → Marketplaces in a terminal
+session). A marketplace added from a local path needs only the `git pull`. Your data
+and `~/.sandbox` are not touched by an update.
+
+### Uninstall
+
+```bash
+sbx remove <service...>            # stop + disable; add --purge to also delete its data volume
+claude plugin uninstall zen-sandbox@zenbytes
+claude plugin marketplace remove zenbytes
+sbx claude uninstall               # only if you used `sbx claude install`
+```
+
+Then delete the `~/.local/bin/sbx` symlink, the `~/.sandbox` folder and the cloned repo.
+Data volumes (`sbx-<service>-data`) stay until you remove them with `--purge` or
+`docker volume rm`.
 
 ## Usage
 
@@ -115,7 +146,7 @@ never has to guess. Ports inside the `sandbox` network do not change (`rustfs:90
 `postgres:5432`, ...). `sbx port` covers built-in services; for a custom service edit
 its yaml.
 
-### Migrate old projects
+### Migrate old projects (experimental)
 
 Already have projects that each run their own postgres / redis / minio? Tell Claude
 "migrate this project to the sandbox" and it follows the playbook in the skill:
@@ -133,7 +164,8 @@ The source is only read, so the old stack keeps working if a migration fails.
 `import postgres` refuses a newer source version, a non-empty target, and extensions
 the sandbox image does not have, and compares table counts after the copy. Bucket
 copies run through a throwaway `rclone/rclone` container. MySQL and Mongo have no
-import command yet.
+import command yet. This part is new: keep the old volumes until you have checked
+the migrated project yourself.
 
 ### Custom services
 
@@ -152,9 +184,29 @@ Defaults: user `sandbox`, password `sandbox123`, ports bound to `127.0.0.1`.
 
 ## Notes
 
-- Works with Docker Desktop, OrbStack, colima, Linux Docker. Needs Docker Compose v2.20+.
+- Tested on macOS with Docker Desktop and on Linux (CI). It should also work with
+  OrbStack and colima, but those are not tested.
 - `sbx` is plain bash (3.2 compatible), no other dependencies.
-- S3 storage is RustFS (`rustfs/rustfs:latest`), since MinIO no longer ships community
-  images. Override with `RUSTFS_IMAGE=` in `~/.sandbox/.env`. Console: `http://localhost:9001/rustfs/console/`
-  (use the UI port from `sbx info rustfs` if you changed it).
+- S3 storage is RustFS (pinned to `rustfs/rustfs:1.0.5`), since MinIO no longer ships
+  community images. Override with `RUSTFS_IMAGE=` in `~/.sandbox/.env`. Console:
+  `http://localhost:9001/rustfs/console/` (use the UI port from `sbx info rustfs` if you
+  changed it).
+- Image versions are pinned and can be changed in `~/.sandbox/.env`: `POSTGRES_VERSION`,
+  `MYSQL_VERSION`, `REDIS_VERSION`, `RABBITMQ_VERSION`, `MONGO_VERSION`, `MAILPIT_VERSION`,
+  `RUSTFS_IMAGE`.
 - If you run Portainer, the stack shows up as a "Limited" compose stack named `sandbox`.
+
+## Security
+
+This is a tool for local development only. The default login (`sandbox` / `sandbox123`)
+is public, and every project shares the same servers. Ports bind to `127.0.0.1` by
+default; do not set `SBX_BIND=0.0.0.0` on an untrusted network, and never use this
+stack for production or for real customer data.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+[MIT](LICENSE)
