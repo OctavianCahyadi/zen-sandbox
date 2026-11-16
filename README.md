@@ -1,15 +1,57 @@
-# zen-sandbox
+<h1 align="center">zen-sandbox</h1>
+
+<p align="center">
+  <b>One shared local Docker stack for all your dev projects.</b><br>
+  Start postgres, redis, rabbitmq and S3 once. Give every project its own database, vhost and bucket.
+</p>
+
+<p align="center">
+  <a href="https://github.com/OctavianCahyadi/zen-sandbox/actions/workflows/ci.yml"><img src="https://github.com/OctavianCahyadi/zen-sandbox/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
+  <img src="https://img.shields.io/badge/shell-bash%203.2%2B-4EAA25.svg" alt="bash 3.2+">
+  <img src="https://img.shields.io/badge/Claude%20Code-plugin-D97757.svg" alt="Claude Code plugin">
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#migrate-old-projects-experimental">Migrate</a> ·
+  <a href="#custom-services">Custom services</a>
+</p>
 
 ![zen-sandbox: one shared local Docker stack for all your dev projects](.github/social-preview.png)
 
-[![ci](https://github.com/OctavianCahyadi/zen-sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/OctavianCahyadi/zen-sandbox/actions/workflows/ci.yml)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+<img src=".github/demo.gif" alt="zen-sandbox demo: sbx up, sbx project init, sbx env" width="270" align="right">
 
-One shared local Docker stack for all your dev projects, plus a Claude Code plugin so
-every Claude session knows what is running and how to use it.
+## Why
 
-Stop creating a new postgres/redis/rabbitmq stack for every project. Start the services
-once, then give each project its own database / vhost / bucket on the shared servers.
+Every new project adds another postgres, another redis and, sooner or later, a
+"port is already allocated" error. Three projects means six containers doing the
+job of two.
+
+zen-sandbox runs each service **once** and shares it:
+
+- **One stack** – postgres, mysql, redis, rabbitmq, mongo, rustfs (S3), mailpit, or your own service.
+- **Isolated per project** – `sbx project init myapp` creates a database + user, a RabbitMQ vhost and an S3 bucket named `myapp`.
+- **Ready-made env** – `sbx env myapp >> .env` prints the connection strings, for the host or for Docker.
+- **No port fights** – `sbx port` shows who holds a busy port and can pick a free one.
+- **Claude Code plugin** – every session starts knowing what is running, on which port, so Claude reuses the sandbox instead of adding services to your compose file.
+- **No dependencies** – one bash script and Docker Compose. Your data stays in Docker volumes.
+
+## Quick start
+
+```bash
+git clone https://github.com/OctavianCahyadi/zen-sandbox ~/.zen-sandbox
+~/.zen-sandbox/install.sh
+sbx up postgres redis
+sbx project init myapp
+sbx env myapp >> .env
+```
+
+<br clear="right">
+
+## How it works
 
 ```
 ┌──────────── docker project "sandbox" (network: sandbox) ────────────┐
